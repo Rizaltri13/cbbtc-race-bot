@@ -35,6 +35,15 @@
 //     day that probe is nearly the whole loss — the cheapest
 //     qualifying result a long-only bot can post.
 //
+// Warm-up handling: when the harness opens with warm-up bars (the bars
+// before the scored window, whose orders are all rejected), the adapter
+// feeds their closes into the bot's history via noteClose() without
+// asking for decisions. The EMAs and the momentum lookback therefore
+// start the scored window already warm instead of blind, while every
+// seq-based rule (entry bar, probe bar, break bar) still counts scored
+// bars only, and the opening-dump veto still anchors on the first
+// scored close.
+//
 // Pure and deterministic: no clock, no randomness, no I/O beyond the
 // wire. The same bars always produce the same orders.
 
@@ -77,10 +86,21 @@ class TrendBot {
   trades = 0;
   done = false; // exited a real position: the window is over
   vetoed = false; // early entry skipped (opening dump)
+  anchor = 0; // first scored close: the opening-dump veto compares against it
+
+  /**
+   * Record a warm-up bar's close as history only: no decision is taken
+   * on it and it consumes no scored seq, but the EMAs and the momentum
+   * lookback see it, so the scored window starts with warm indicators.
+   */
+  noteClose(close: number): void {
+    this.closes.push(close);
+  }
 
   /** Feed one scored bar's close (seq is its 0-based scored index). */
   onClose(seq: number, close: number): Action {
     this.closes.push(close);
+    if (seq === 0) this.anchor = close;
     const n = this.closes.length;
 
     if (this.inPosition) {
@@ -109,7 +129,7 @@ class TrendBot {
 
     // Early entry: take exposure unless the window opened with a dump.
     if (seq === ENTRY_BAR && this.trades === 0) {
-      if (close < this.closes[0] * (1 - DUMP_VETO)) {
+      if (close < this.anchor * (1 - DUMP_VETO)) {
         this.vetoed = true;
         return null;
       }
@@ -161,10 +181,14 @@ await runBars({
     priceScale = first.price_scale;
   },
   onBatch(state: BarsState): OrderInput[] {
-    if (state.warmingUp) return [];
     const rawClose = state.close(symbol);
     if (rawClose === null) return [];
     const close = Number(rawClose) / 10 ** priceScale;
+    if (state.warmingUp) {
+      // History only: warm the indicators, never trade a warm-up bar.
+      bot.noteClose(close);
+      return [];
+    }
     const action = bot.onClose(counter, close);
     counter += 1;
     if (action === null) return [];
